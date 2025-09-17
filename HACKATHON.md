@@ -101,8 +101,8 @@
 
 ```bash
 # 1. Clone and setup (5 minutes)
-git clone https://github.com/Ya-shh/SparkSquare-Hackathon.git
-cd SparkSquare-Hackathon
+git clone https://github.com/Ya-shh/SparkSquare-hackathon-qdrant.git
+cd SparkSquare-hackathon-qdrant
 npm run first-setup
 
 # 2. Start the application
