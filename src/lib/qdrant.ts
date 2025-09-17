@@ -30,7 +30,7 @@ const hf = hasHFKey
   ? new HfInference(process.env.HF_API_KEY)
   : null;
 
-let mistral = null;
+let mistral: any = null;
 if (hasMistralKey) {
   try {
     const { Mistral } = require('@mistralai/mistralai');
@@ -178,7 +178,7 @@ async function createPayloadIndexes(collectionName: string) {
         field_name: field,
         field_schema: field === 'createdAtTs' ? 'integer' : 'keyword'
       });
-    } catch (error) {
+    } catch (error: any) {
       console.warn(`Could not create index for ${field} in ${collectionName}:`, error.message);
     }
   }
@@ -199,69 +199,545 @@ export async function generateEmbedding(text: string, kind: 'query' | 'passage' 
     return generateMockEmbedding('empty_text', EMBEDDING_DIM);
   }
 
+  const providers = getAvailableProviders();
+  let lastError: any = null;
+
+  // Try each provider in order of preference
+  for (const provider of providers) {
+    try {
+      switch (provider.name) {
+        case 'mistral':
+          if (provider.shouldSkip()) {
+            console.log(`Skipping Mistral due to rate limiting or backoff`);
+            continue;
+          }
+          return await generateMistralEmbedding(text);
+          
+        case 'huggingface':
+          return await generateE5EmbeddingHF(text);
+          
+        case 'openai':
+          return await generateOpenAIEmbedding(text);
+          
+        default:
+          continue;
+      }
+    } catch (error: any) {
+      lastError = error;
+      const errorType = getErrorType(error);
+      console.warn(`${provider.name} embedding failed (${errorType}), trying next provider:`, error.message);
+      
+      // If it's a rate limit error, we might want to try other providers
+      // but not completely give up on this provider
+      if (errorType === 'rate_limit' && provider.name === 'mistral') {
+        // Mistral rate limiting is handled internally, so this shouldn't happen often
+        continue;
+      }
+    }
+  }
+
+  // If all providers failed, generate a deterministic embedding based on text content
+  console.warn(`All embedding providers failed. Last error: ${lastError?.message || 'Unknown'}. Using enhanced mock embedding.`);
+  return generateEnhancedMockEmbedding(text, EMBEDDING_DIM);
+}
+
+// Get available providers in order of preference
+function getAvailableProviders(): Array<{
+  name: string;
+  available: boolean;
+  shouldSkip: () => boolean;
+}> {
+  const providers = [];
+  
+  // Mistral (preferred if configured)
+  if (hasMistralKey && mistral) {
+    providers.push({
+      name: 'mistral',
+      available: true,
+      shouldSkip: () => {
+        const status = getMistralRateLimitStatus();
+        return status.isBackedOff || status.remaining <= 0;
+      }
+    });
+  }
+  
+  // HuggingFace
+  if (hasHFKey) {
+    providers.push({
+      name: 'huggingface',
+      available: true,
+      shouldSkip: () => false
+    });
+  }
+  
+  // OpenAI
+  if (hasOpenAIKey && openai) {
+    providers.push({
+      name: 'openai',
+      available: true,
+      shouldSkip: () => false
+    });
+  }
+  
+  // Sort by preference if specified
+  if (PREFER_MISTRAL_OVER_HF) {
+    return providers.sort((a, b) => {
+      if (a.name === 'mistral') return -1;
+      if (b.name === 'mistral') return 1;
+      return 0;
+    });
+  }
+  
+  return providers;
+}
+
+// Classify error types for better fallback decisions
+function getErrorType(error: any): 'rate_limit' | 'auth' | 'network' | 'server' | 'unknown' {
+  if (error.status === 429 || error.message?.includes('Rate limit')) {
+    return 'rate_limit';
+  }
+  if (error.status === 401 || error.status === 403) {
+    return 'auth';
+  }
+  if (error.status >= 500 || error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+    return 'server';
+  }
+  if (error.code === 'ENOTFOUND' || error.code === 'ECONNRESET') {
+    return 'network';
+  }
+  return 'unknown';
+}
+
+// Enhanced mock embedding that's more deterministic and content-aware
+function generateEnhancedMockEmbedding(text: string, dimensions: number = EMBEDDING_DIM): number[] {
+  // Create a more sophisticated mock that considers text content
+  const words = text.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 0);
+  const textLength = text.length;
+  const wordCount = words.length;
+  
+  // Create embedding based on text characteristics
+  const embedding = Array(dimensions).fill(0).map((_, i) => {
+    let value = 0;
+    
+    // Base pattern from text hash
+    const hash = hashStringToNumber(text);
+    value += Math.sin(hash + i) * 0.3;
+    
+    // Add word-based features
+    if (words.length > 0) {
+      const wordIndex = i % words.length;
+      const wordHash = hashStringToNumber(words[wordIndex]);
+      value += Math.cos(wordHash + i) * 0.2;
+    }
+    
+    // Add text length features
+    value += Math.sin(textLength * 0.01 + i) * 0.1;
+    
+    // Add word count features
+    value += Math.cos(wordCount * 0.1 + i) * 0.1;
+    
+    // Add position-based variation
+    value += Math.sin(i * 0.1) * 0.3;
+    
+    return value;
+  });
+  
+  // Normalize to unit vector
+  return l2Normalize(embedding);
+}
+
+// Batch embedding generation for efficiency
+export async function generateEmbeddingsBatch(
+  texts: string[], 
+  kind: 'query' | 'passage' = 'passage'
+): Promise<number[][]> {
+  if (!texts || texts.length === 0) {
+    return [];
+  }
+
+  // Filter out empty texts
+  const validTexts = texts.filter(text => text && text.trim().length > 0);
+  if (validTexts.length === 0) {
+    return texts.map(() => generateMockEmbedding('empty_text', EMBEDDING_DIM));
+  }
+
   try {
     // Try Mistral embeddings first if available and preferred
     if (hasMistralKey && mistral && PREFER_MISTRAL_OVER_HF) {
       try {
-        return await generateMistralEmbedding(text);
-      } catch (error) {
-        console.warn('Mistral embedding failed, trying fallback:', error.message);
+        return await generateMistralEmbeddingsBatch(validTexts);
+      } catch (error: any) {
+        console.warn('Mistral batch embedding failed, trying fallback:', error.message);
       }
     }
 
-    // Try HuggingFace embeddings if available
-    if (hasHFKey) {
-      try {
-        return await generateE5EmbeddingHF(text);
-      } catch (error) {
-        console.warn('HuggingFace embedding failed, trying fallback:', error.message);
-      }
-    }
+    // Fallback to individual embeddings for other providers
+    const embeddings = await Promise.allSettled(
+      validTexts.map(text => generateEmbedding(text, kind))
+    );
 
-    // Try OpenAI embeddings if available
-    if (hasOpenAIKey && openai) {
-      try {
-        return await generateOpenAIEmbedding(text);
-      } catch (error) {
-        console.warn('OpenAI embedding failed, trying fallback:', error.message);
+    return embeddings.map((result, index) => {
+      if (result.status === 'fulfilled') {
+        return result.value;
+      } else {
+        console.warn(`Failed to generate embedding for text ${index}:`, result.reason);
+        return generateMockEmbedding(validTexts[index] || 'failed_text', EMBEDDING_DIM);
       }
-    }
-
-    // Try Mistral if not preferred but available
-    if (hasMistralKey && mistral && !PREFER_MISTRAL_OVER_HF) {
-      try {
-        return await generateMistralEmbedding(text);
-      } catch (error) {
-        console.warn('Mistral embedding failed, using mock:', error.message);
-      }
-    }
-
-    // Fall back to mock embeddings
-    console.warn('No embedding providers available or all failed, using mock embeddings');
-    return generateMockEmbedding(text, EMBEDDING_DIM);
+    });
 
   } catch (error) {
-    console.error('Error generating embedding:', error);
-    return generateMockEmbedding(text, EMBEDDING_DIM);
+    console.error('Error generating batch embeddings:', error);
+    return validTexts.map(text => generateMockEmbedding(text, EMBEDDING_DIM));
   }
 }
+
+// Batch Mistral embedding generation
+async function generateMistralEmbeddingsBatch(texts: string[]): Promise<number[][]> {
+  if (!mistral) throw new Error('Mistral client not initialized');
+  
+  const BATCH_SIZE = 50; // Optimal batch size for Mistral API
+  const results: number[][] = [];
+  
+  // Process in batches
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const batch = texts.slice(i, i + BATCH_SIZE);
+    const batchResults = await generateMistralEmbeddingWithRetry(batch);
+    results.push(...batchResults);
+  }
+  
+  return results;
+}
+
+// Rate limiting state for Mistral API
+const mistralRateLimit = {
+  requests: 0,
+  resetTime: Date.now() + 60000, // Reset every minute
+  maxRequests: 55, // Leave buffer under 60 RPM limit
+  backoffUntil: 0
+};
+
+// Reset rate limit counter every minute
+setInterval(() => {
+  if (Date.now() >= mistralRateLimit.resetTime) {
+    mistralRateLimit.requests = 0;
+    mistralRateLimit.resetTime = Date.now() + 60000;
+    if (mistralRateLimit.backoffUntil < Date.now()) {
+      mistralRateLimit.backoffUntil = 0;
+    }
+  }
+}, 1000);
 
 async function generateMistralEmbedding(text: string): Promise<number[]> {
   if (!mistral) throw new Error('Mistral client not initialized');
   
-  try {
-    const response = await mistral.embeddings.create({
-      model: 'mistral-embed',
-      inputs: [text],
-    });
-    
-    if (response.data && response.data.length > 0) {
-      return response.data[0].embedding;
+  return generateMistralEmbeddingWithRetry([text])
+    .then(results => results[0]);
+}
+
+async function generateMistralEmbeddingWithRetry(
+  texts: string[], 
+  maxRetries: number = 5,
+  baseDelay: number = 1000
+): Promise<number[][]> {
+  if (!mistral) throw new Error('Mistral client not initialized');
+  
+  // Check if we're in backoff period
+  if (mistralRateLimit.backoffUntil > Date.now()) {
+    const waitTime = mistralRateLimit.backoffUntil - Date.now();
+    console.log(`Mistral API in backoff, waiting ${waitTime}ms`);
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+  
+  // Check rate limit
+  if (mistralRateLimit.requests >= mistralRateLimit.maxRequests) {
+    const waitTime = mistralRateLimit.resetTime - Date.now();
+    console.log(`Mistral rate limit reached, waiting ${waitTime}ms for reset`);
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+    mistralRateLimit.requests = 0;
+    mistralRateLimit.resetTime = Date.now() + 60000;
+  }
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      mistralRateLimit.requests++;
+      
+      const response = await mistral.embeddings.create({
+        model: 'mistral-embed',
+        inputs: texts.slice(0, 100), // Respect batch size limit
+      });
+      
+      // Update rate limit info from response headers
+      updateRateLimitFromHeaders(response);
+      
+      if (response.data && response.data.length > 0) {
+        logMistralSuccess(texts.length, attempt);
+        return response.data.map((item: any) => item.embedding);
+      }
+      throw new Error('No embedding data received from Mistral');
+      
+    } catch (error: any) {
+      const errorDetails = extractErrorDetails(error);
+      logMistralError(attempt + 1, errorDetails, texts.length);
+      
+      // Update rate limit info from error headers
+      updateRateLimitFromHeaders(error.response || error);
+      
+      // Handle rate limit specifically
+      if (error.status === 429 || error.message?.includes('Rate limit')) {
+        const retryAfter = extractRetryAfter(error) || (baseDelay * Math.pow(2, attempt));
+        mistralRateLimit.backoffUntil = Date.now() + retryAfter;
+        
+        console.log(`Rate limit hit, backing off for ${retryAfter}ms. Current: ${mistralRateLimit.requests}/${mistralRateLimit.maxRequests}`);
+        
+        if (attempt < maxRetries - 1) {
+          await new Promise(resolve => setTimeout(resolve, retryAfter));
+          continue;
+        }
+      }
+      
+      // Handle other retryable errors
+      if (attempt < maxRetries - 1 && isRetryableError(error)) {
+        const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
+        console.log(`Retrying Mistral API call in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      throw error;
     }
-    throw new Error('No embedding data received from Mistral');
+  }
+  
+  throw new Error(`Mistral embedding failed after ${maxRetries} attempts`);
+}
+
+// Update rate limit state from API response headers
+function updateRateLimitFromHeaders(response: any) {
+  try {
+    const headers = response?.headers || {};
+    
+    // Extract rate limit information
+    const limitHeader = headers['x-ratelimit-limit-req-minute'] || headers['x-ratelimit-limit'];
+    const remainingHeader = headers['x-ratelimit-remaining-req-minute'] || headers['x-ratelimit-remaining'];
+    const resetHeader = headers['x-ratelimit-reset'] || headers['x-ratelimit-reset-req-minute'];
+    
+    if (limitHeader) {
+      const limit = parseInt(limitHeader);
+      if (!isNaN(limit)) {
+        mistralRateLimit.maxRequests = Math.max(limit - 5, 10); // Leave buffer
+      }
+    }
+    
+    if (remainingHeader) {
+      const remaining = parseInt(remainingHeader);
+      if (!isNaN(remaining)) {
+        mistralRateLimit.requests = Math.max(0, mistralRateLimit.maxRequests - remaining);
+      }
+    }
+    
+    if (resetHeader) {
+      const reset = parseInt(resetHeader);
+      if (!isNaN(reset)) {
+        // If reset is a timestamp
+        if (reset > 1000000000) {
+          mistralRateLimit.resetTime = reset * 1000;
+        } else {
+          // If reset is seconds from now
+          mistralRateLimit.resetTime = Date.now() + (reset * 1000);
+        }
+      }
+    }
+    
   } catch (error) {
-    console.error('Mistral embedding error:', error);
-    throw error;
+    // Silently handle header parsing errors
+  }
+}
+
+function extractRetryAfter(error: any): number | null {
+  try {
+    // Check for Retry-After header
+    const retryAfter = error.response?.headers?.['retry-after'] || 
+                      error.headers?.['retry-after'];
+    if (retryAfter) {
+      return parseInt(retryAfter) * 1000;
+    }
+    
+    // Check for rate limit reset time
+    const resetTime = error.response?.headers?.['x-ratelimit-reset-requests'] || 
+                     error.headers?.['x-ratelimit-reset-requests'];
+    if (resetTime) {
+      return Math.max(0, parseInt(resetTime) * 1000 - Date.now());
+    }
+    
+    // Default backoff for rate limits
+    return 60000; // 1 minute
+  } catch {
+    return null;
+  }
+}
+
+function isRetryableError(error: any): boolean {
+  if (!error.status) return false;
+  
+  // Retry on 429 (rate limit), 502, 503, 504 (server errors)
+  return [429, 502, 503, 504].includes(error.status);
+}
+
+// Enhanced error details extraction
+function extractErrorDetails(error: any): {
+  status?: number;
+  message: string;
+  code?: string;
+  correlationId?: string;
+  retryAfter?: number;
+} {
+  const details: any = {
+    message: error.message || 'Unknown error'
+  };
+  
+  if (error.status) {
+    details.status = error.status;
+  }
+  
+  if (error.response) {
+    const body = error.response.body || error.response.data;
+    if (body) {
+      if (typeof body === 'string') {
+        try {
+          const parsed = JSON.parse(body);
+          details.code = parsed.code;
+          details.message = parsed.message || details.message;
+        } catch {
+          // Use raw body as message if not JSON
+          details.message = body;
+        }
+      } else if (typeof body === 'object') {
+        details.code = body.code;
+        details.message = body.message || details.message;
+      }
+    }
+    
+    // Extract correlation ID for debugging
+    const headers = error.response.headers || {};
+    details.correlationId = headers['mistral-correlation-id'] || headers['x-request-id'];
+    
+    // Extract retry after
+    const retryAfter = headers['retry-after'];
+    if (retryAfter) {
+      details.retryAfter = parseInt(retryAfter);
+    }
+  }
+  
+  return details;
+}
+
+// Enhanced logging functions
+function logMistralSuccess(textCount: number, attempts: number) {
+  const attemptsText = attempts > 0 ? ` (after ${attempts} retries)` : '';
+  console.log(`✅ Mistral embeddings successful: ${textCount} texts processed${attemptsText}. Rate limit: ${mistralRateLimit.requests}/${mistralRateLimit.maxRequests}`);
+}
+
+function logMistralError(attempt: number, errorDetails: any, textCount: number) {
+  const parts = [
+    `❌ Mistral embedding attempt ${attempt} failed:`,
+    `Status: ${errorDetails.status || 'unknown'}`,
+    `Message: ${errorDetails.message}`,
+    `Texts: ${textCount}`,
+    `Rate limit: ${mistralRateLimit.requests}/${mistralRateLimit.maxRequests}`
+  ];
+  
+  if (errorDetails.code) {
+    parts.push(`Code: ${errorDetails.code}`);
+  }
+  
+  if (errorDetails.correlationId) {
+    parts.push(`Correlation ID: ${errorDetails.correlationId}`);
+  }
+  
+  if (errorDetails.retryAfter) {
+    parts.push(`Retry after: ${errorDetails.retryAfter}s`);
+  }
+  
+  console.error(parts.join(' | '));
+}
+
+// Rate limit status checker
+export function getMistralRateLimitStatus(): {
+  requests: number;
+  maxRequests: number;
+  remaining: number;
+  resetTime: number;
+  isBackedOff: boolean;
+  backoffUntil: number;
+  resetIn: number;
+  backoffIn: number;
+} {
+  const now = Date.now();
+  return {
+    requests: mistralRateLimit.requests,
+    maxRequests: mistralRateLimit.maxRequests,
+    remaining: Math.max(0, mistralRateLimit.maxRequests - mistralRateLimit.requests),
+    resetTime: mistralRateLimit.resetTime,
+    isBackedOff: mistralRateLimit.backoffUntil > now,
+    backoffUntil: mistralRateLimit.backoffUntil,
+    resetIn: Math.max(0, mistralRateLimit.resetTime - now),
+    backoffIn: Math.max(0, mistralRateLimit.backoffUntil - now)
+  };
+}
+
+// Debug function to check embedding provider status
+export function getEmbeddingProviderStatus(): {
+  providers: Array<{
+    name: string;
+    available: boolean;
+    configured: boolean;
+    status: string;
+  }>;
+  mistralRateLimit: ReturnType<typeof getMistralRateLimitStatus>;
+  preferredProvider: string;
+} {
+  const providers = [
+    {
+      name: 'mistral',
+      available: hasMistralKey && !!mistral,
+      configured: hasMistralKey,
+      status: hasMistralKey && mistral ? 
+        (getMistralRateLimitStatus().isBackedOff ? 'backed-off' : 'ready') : 
+        'not-configured'
+    },
+    {
+      name: 'huggingface',
+      available: hasHFKey,
+      configured: hasHFKey,
+      status: hasHFKey ? 'ready' : 'not-configured'
+    },
+    {
+      name: 'openai',
+      available: hasOpenAIKey && !!openai,
+      configured: hasOpenAIKey,
+      status: hasOpenAIKey && openai ? 'ready' : 'not-configured'
+    }
+  ];
+
+  const preferredProvider = PREFER_MISTRAL_OVER_HF && hasMistralKey ? 'mistral' : 
+                           hasHFKey ? 'huggingface' :
+                           hasOpenAIKey ? 'openai' : 'none';
+
+  return {
+    providers,
+    mistralRateLimit: getMistralRateLimitStatus(),
+    preferredProvider
+  };
+}
+
+// Helper function to wait for Mistral rate limit reset
+export async function waitForMistralReset(): Promise<void> {
+  const status = getMistralRateLimitStatus();
+  if (status.isBackedOff && status.backoffIn > 0) {
+    console.log(`Waiting ${Math.ceil(status.backoffIn / 1000)}s for Mistral backoff to clear...`);
+    await new Promise(resolve => setTimeout(resolve, status.backoffIn));
+  } else if (status.remaining <= 0 && status.resetIn > 0) {
+    console.log(`Waiting ${Math.ceil(status.resetIn / 1000)}s for Mistral rate limit reset...`);
+    await new Promise(resolve => setTimeout(resolve, status.resetIn));
   }
 }
 
@@ -376,10 +852,18 @@ async function generateImageEmbedding(image: Buffer | string): Promise<number[]>
     // Use CLIP or similar vision model for image embeddings
     const response = await hf.featureExtraction({
       model: 'openai/clip-vit-base-patch32',
-      inputs: image instanceof Buffer ? image : image
+      inputs: image as any // Type assertion for compatibility
     });
     
-    return Array.isArray(response) ? response : [];
+    // Handle different response formats
+    if (Array.isArray(response)) {
+      return response as number[];
+    } else if (typeof response === 'number') {
+      return [response];
+    } else if (Array.isArray(response[0])) {
+      return (response as number[][])[0];
+    }
+    return [];
   } catch (error) {
     console.error('Image embedding generation failed:', error);
     // Return a mock embedding for development
@@ -551,10 +1035,12 @@ export async function generateAdvancedMultiModalEmbedding(
           model: MULTIMODAL_MODEL,
           inputs: content.text,
         });
-        embeddings.text = Array.isArray(textEmbedding) ? textEmbedding : textEmbedding[0];
+        if (textEmbedding) {
+          embeddings.text = Array.isArray(textEmbedding) ? textEmbedding as number[] : [textEmbedding as number];
+        }
         metadata.textModel = MULTIMODAL_MODEL;
       } else {
-        embeddings.text = await generateEmbedding(content.text, 'text');
+        embeddings.text = await generateEmbedding(content.text, 'passage');
         metadata.textModel = 'fallback';
       }
     }
@@ -578,7 +1064,8 @@ export async function generateAdvancedMultiModalEmbedding(
         embeddings.document = documentEmbedding;
         metadata.documentModel = MULTIMODAL_MODEL;
       } else {
-        embeddings.document = await generateDocumentEmbedding(content.document);
+        const documentText = await extractTextFromDocument(content.document);
+        embeddings.document = await generateEmbedding(documentText, 'passage');
         metadata.documentModel = 'fallback';
       }
     }
@@ -595,12 +1082,21 @@ export async function generateAdvancedMultiModalEmbedding(
   } catch (error) {
     console.error('Error generating advanced multi-modal embeddings:', error);
     // Return mock embeddings for development
-    return {
-      text: content.text ? new Array(MULTIMODAL_DIM).fill(0).map(() => Math.random() - 0.5) : undefined,
-      image: content.image ? new Array(MULTIMODAL_DIM).fill(0).map(() => Math.random() - 0.5) : undefined,
-      document: content.document ? new Array(MULTIMODAL_DIM).fill(0).map(() => Math.random() - 0.5) : undefined,
-      metadata: { error: 'fallback_mode', timestamp: new Date().toISOString() }
-    };
+    const result: { [key: string]: number[] | any } = {};
+    
+    if (content.text) {
+      result.text = new Array(MULTIMODAL_DIM).fill(0).map(() => Math.random() - 0.5);
+    }
+    if (content.image) {
+      result.image = new Array(MULTIMODAL_DIM).fill(0).map(() => Math.random() - 0.5);
+    }
+    if (content.document) {
+      result.document = new Array(MULTIMODAL_DIM).fill(0).map(() => Math.random() - 0.5);
+    }
+    
+    result.metadata = { error: 'fallback_mode', timestamp: new Date().toISOString() };
+    
+    return result;
   }
 }
 
@@ -612,10 +1108,16 @@ async function generateAdvancedImageEmbedding(image: Buffer | string): Promise<n
     // Use advanced vision model for better image understanding
     const response = await hf.featureExtraction({
       model: MULTIMODAL_MODEL, // Use the multimodal model for images
-      inputs: image instanceof Buffer ? image : image
+      inputs: image as any
     });
     
-    return Array.isArray(response) ? response : response[0];
+    // Handle different response formats
+    if (Array.isArray(response)) {
+      return response as number[];
+    } else if (response && typeof response === 'object' && Array.isArray((response as any)[0])) {
+      return (response as number[][])[0];
+    }
+    return [];
   } catch (error) {
     console.error('Advanced image embedding generation failed:', error);
     // Fallback to basic image embedding
@@ -635,7 +1137,10 @@ async function generateAdvancedDocumentEmbedding(document: Buffer | string): Pro
         model: MULTIMODAL_MODEL,
         inputs: documentText,
       });
-      return Array.isArray(response) ? response : response[0];
+      if (response) {
+        return Array.isArray(response) ? response as number[] : [response as number];
+      }
+      return [];
     } else {
       return generateEmbedding(documentText, 'passage');
     }
@@ -1102,15 +1607,15 @@ async function getCollaborativeRecommendations(userId: string, limit: number): P
 
     // Find similar users using sparse vector similarity
     const similarUsers = await qdrantClient.search(COLLECTIONS.RECOMMENDATIONS, {
-      vector: userInteractions,
+      vector: userInteractions as any,
       limit: 20,
       with_payload: true
     });
 
     // Get recommendations from similar users
-    const recommendations = [];
+    const recommendations: any[] = [];
     for (const user of similarUsers) {
-      const userRecs = await getUserRecommendations(user.payload.userId, limit);
+      const userRecs = await getUserRecommendations((user.payload as any)?.userId, limit);
       recommendations.push(...userRecs);
     }
 
@@ -1820,11 +2325,13 @@ export async function indexUserInteractions(userId: string) {
     const categoryPreferences: { [categoryId: string]: number } = {};
     
     userVotes.forEach(vote => {
-      const rating = vote.type === 'UP' ? 1 : -1;
-      userRatings[vote.post.id] = rating;
-      
-      const categoryId = vote.post.categoryId;
-      categoryPreferences[categoryId] = (categoryPreferences[categoryId] || 0) + rating;
+      const rating = (vote as any).type === 'UP' ? 1 : -1;
+      if (vote.post) {
+        userRatings[vote.post.id] = rating;
+        
+        const categoryId = vote.post.categoryId;
+        categoryPreferences[categoryId] = (categoryPreferences[categoryId] || 0) + rating;
+      }
     });
 
     const userSparseVector = generateSparseVector(userRatings);
@@ -1969,7 +2476,6 @@ export async function crossModalSearch(
 
     const results = await qdrantClient.search(COLLECTIONS.MULTIMODAL, {
       vector: queryEmbedding,
-      using: targetModality,
       limit,
       score_threshold: scoreThreshold,
       filter: filters,
@@ -2023,6 +2529,7 @@ export async function batchUpdateRecommendations(userIds: string[]) {
     return false;
   }
 }
+
 
 
 

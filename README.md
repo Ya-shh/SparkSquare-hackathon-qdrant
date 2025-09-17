@@ -183,40 +183,12 @@ This starts:
 - `GOOGLE_CLIENT_ID` & `GOOGLE_CLIENT_SECRET` - Google OAuth
 - `GITHUB_CLIENT_ID` & `GITHUB_CLIENT_SECRET` - GitHub OAuth
 
-## 🤝 Contributing
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit changes: `git commit -m 'Add amazing feature'`
-4. Push to branch: `git push origin feature/amazing-feature`
-5. Open a Pull Request
 
-## 🆕 Recent Updates (Latest Version)
-
-### Real Data Integration
-- ✅ **Fixed Statistics**: Community stats now show real data from database instead of hardcoded values
-- ✅ **Live User Counts**: "Our Community (X Members)" now displays actual user count from database  
-- ✅ **Real Authors**: User profiles and posts show actual users from database, not mock data
-- ✅ **Working Qdrant**: Live Activity feed uses real Qdrant vector search for AI recommendations
-- ✅ **Database API**: New `/api/users` endpoint for fetching real user data with pagination and search
-- ✅ **Enhanced Setup**: Improved setup scripts ensure new users get working real data from the start
-
-### Statistics Now Show:
-- **Active Members**: Real count from database (e.g., 3 instead of hardcoded 24)
-- **Daily Discussions**: Calculated from actual posts + comments activity
-- **Topics Covered**: Real category count from database
-- **Expert Contributors**: Users who have actually created posts
-- **AI Recommendations**: Powered by real Qdrant vector embeddings
-
-### Fixed Issues:
-- Environment file creation (`.env` instead of `.env.local`)
-- Prisma seed script configuration (TypeScript support)
-- Database connection and real-time statistics
-- Live Activity showing genuine "🤖 Qdrant AI-Powered" functionality
 
 ## 👨‍💻 Author
 
-**Yash** - AI Engineer focusing on NLP, MLOps & AI  
+**Yash** - Focusing on NLP, MLOps & AI  
 🔗 [GitHub](https://github.com/Ya-shh) | 🤗 [HuggingFace](https://huggingface.co/yashvardhan7) | 📍 Mumbai, India
 
 *Interested in NLP, MLOps & AI. Currently expanding knowledge in Advanced RAG & Generative AI.*
@@ -225,7 +197,7 @@ This starts:
 
 This project is licensed under the MIT License.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - [Next.js](https://nextjs.org/) - React framework
 - [Qdrant](https://qdrant.tech/) - Vector database
