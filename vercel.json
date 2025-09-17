@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "buildCommand": "npm run vercel-build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "framework": "nextjs",
+  "outputDirectory": ".next",
+  "env": {
+    "NODE_ENV": "production",
+    "NEXT_TELEMETRY_DISABLED": "1",
+    "NEXT_PUBLIC_VERCEL_ENV": "production",
+    "NEXT_PRIVATE_STANDALONE": "true"
+  }
+} 
